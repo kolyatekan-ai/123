@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Голосовой чат</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; background: #1a1a2e; color: #fff; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; }
+    .container { background: #16213e; padding: 30px; border-radius: 10px; max-width: 500px; width: 100%; text-align: center; }
+    h1 { margin-bottom: 20px; color: #0f3460; }
+    .input-group { margin: 15px 0; }
+    input { width: 100%; padding: 12px; border: none; border-radius: 5px; font-size: 16px; margin: 5px 0; }
+    button { width: 100%; padding: 12px; margin: 5px 0; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; background: #0f3460; color: white; transition: 0.3s; }
+    button:hover { background: #533483; }
+    button:disabled { background: #555; cursor: not-allowed; }
+    .room-info { background: #0f3460; padding: 15px; border-radius: 5px; margin: 15px 0; word-break: break-all; }
+    .users { margin: 15px 0; }
+    .user { display: inline-block; background: #533483; padding: 5px 15px; border-radius: 20px; margin: 5px; }
+    .controls { display: none; margin-top: 20px; }
+    .controls button { background: #e94560; }
+    .controls button.muted { background: #555; }
+    #status { margin: 10px 0; padding: 10px; border-radius: 5px; display: none; }
+    .success { background: #0f3460; }
+    .error { background: #e94560; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Голосовой чат</h1>
+    <div id="status"></div>
+    
+    <div id="lobby">
+      <div class="input-group">
+        <button id="createBtn">Создать комнату</button>
+      </div>
+      <div class="input-group">
+        <input type="text" id="roomInput" placeholder="Введите ID комнаты">
+        <button id="joinBtn">Войти в комнату</button>
+      </div>
+    </div>
+
+    <div id="room" style="display:none;">
+      <div class="room-info">
+        <p>ID комнаты: <strong id="roomId"></strong></p>
+        <p>Поделитесь этим ID с друзьями</p>
+      </div>
+      <div class="users">
+        <p>В комнате:</p>
+        <div id="userList"></div>
+      </div>
+      <div class="controls" id="controls">
+        <button id="muteBtn">Выключить микрофон</button>
+      </div>
+      <button id="leaveBtn" style="margin-top: 10px; background: #e94560;">Выйти</button>
+    </div>
+  </div>
+
+  <script>
+    let ws;
+    let localStream;
+    let peers = new Map();
+    let isMuted = false;
+    let currentRoom = null;
+
+    const lobby = document.getElementById('lobby');
+    const room = document.getElementById('room');
+    const roomIdEl = document.getElementById('roomId');
+    const roomInput = document.getElementById('roomInput');
+    const userList = document.getElementById('userList');
+    const status = document.getElementById('status');
+
+    document.getElementById('createBtn').onclick = createRoom;
+    document.getElementById('joinBtn').onclick = () => joinRoom(roomInput.value);
+    document.getElementById('muteBtn').onclick = toggleMute;
+    document.getElementById('leaveBtn').onclick = leaveRoom;
+
+    function showStatus(msg, type) {
+      status.textContent = msg;
+      status.className = type;
+      status.style.display = 'block';
+      setTimeout(() => status.style.display = 'none', 3000);
+    }
+
+    function connectWebSocket() {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${protocol}//${window.location.host}`);
+
+      ws.onopen = () => console.log('WebSocket подключен');
+      ws.onmessage = handleMessage;
+      ws.onclose = () => setTimeout(connectWebSocket, 3000);
+    }
+
+    function createRoom() {
+      ws.send(JSON.stringify({ type: 'create-room' }));
+    }
+
+    function joinRoom(roomId) {
+      if (!roomId) return showStatus('Введите ID комнаты', 'error');
+      ws.send(JSON.stringify({ type: 'join-room', roomId }));
+    }
+
+    async function handleMessage(event) {
+      const msg = JSON.parse(event.data);
+
+      switch (msg.type) {
+        case 'room-created':
+          currentRoom = msg.roomId;
+          showRoom(msg.roomId);
+          showStatus('Комната создана!', 'success');
+          await startVoice();
+          break;
+
+        case 'room-joined':
+          currentRoom = msg.roomId;
+          showRoom(msg.roomId);
+          showStatus('Вы вошли в комнату', 'success');
+          await startVoice();
+          break;
+
+        case 'user-joined':
+          createPeer(msg.userId, true);
+          break;
+
+        case 'user-left':
+          if (peers.has(msg.userId)) {
+            peers.get(msg.userId).close();
+            peers.delete(msg.userId);
+            updateUserList();
+          }
+          break;
+
+        case 'offer':
+          await handleOffer(msg);
+          break;
+
+        case 'answer':
+          await handleAnswer(msg);
+          break;
+
+        case 'ice-candidate':
+          await handleIceCandidate(msg);
+          break;
+
+        case 'error':
+          showStatus(msg.message, 'error');
+          break;
+      }
+    }
+
+    async function startVoice() {
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        document.getElementById('controls').style.display = 'block';
+      } catch (err) {
+        showStatus('Ошибка доступа к микрофону', 'error');
+      }
+    }
+
+    async function createPeer(userId, isInitiator) {
+      const peer = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      });
+
+      peers.set(userId, peer);
+
+      localStream.getTracks().forEach(track => peer.addTrack(track, localStream));
+
+      peer.onicecandidate = (e) => {
+        if (e.candidate) {
+          ws.send(JSON.stringify({
+            type: 'ice-candidate',
+            candidate: e.candidate,
+            target: userId
+          }));
+        }
+      };
+
+      peer.ontrack = (e) => {
+        if (!document.getElementById(`audio-${userId}`)) {
+          const audio = document.createElement('audio');
+          audio.id = `audio-${userId}`;
+          audio.autoplay = true;
+          audio.srcObject = e.streams[0];
+          document.body.appendChild(audio);
+        }
+      };
+
+      if (isInitiator) {
+        const offer = await peer.createOffer();
+        await peer.setLocalDescription(offer);
+        ws.send(JSON.stringify({
+          type: 'offer',
+          offer: peer.localDescription,
+          target: userId
+        }));
+      }
+
+      updateUserList();
+    }
+
+    async function handleOffer(msg) {
+      if (!peers.has(msg.userId)) {
+        await createPeer(msg.userId, false);
+      }
+      const peer = peers.get(msg.userId);
+      await peer.setRemoteDescription(new RTCSessionDescription(msg.offer));
+      const answer = await peer.createAnswer();
+      await peer.setLocalDescription(answer);
+      ws.send(JSON.stringify({
+        type: 'answer',
+        answer: peer.localDescription,
+        target: msg.userId
+      }));
+    }
+
+    async function handleAnswer(msg) {
+      const peer = peers.get(msg.userId);
+      if (peer) {
+        await peer.setRemoteDescription(new RTCSessionDescription(msg.answer));
+      }
+    }
+
+    async function handleIceCandidate(msg) {
+      const peer = peers.get(msg.userId);
+      if (peer) {
+        await peer.addIceCandidate(new RTCIceCandidate(msg.candidate));
+      }
+    }
+
+    function showRoom(id) {
+      lobby.style.display = 'none';
+      room.style.display = 'block';
+      roomIdEl.textContent = id;
+    }
+
+    function updateUserList() {
+      userList.innerHTML = '';
+      peers.forEach((_, id) => {
+        const el = document.createElement('div');
+        el.className = 'user';
+        el.textContent = `Пользователь ${id.substring(0, 6)}`;
+        userList.appendChild(el);
+      });
+    }
+
+    function toggleMute() {
+      isMuted = !isMuted;
+      localStream.getAudioTracks()[0].enabled = !isMuted;
+      const btn = document.getElementById('muteBtn');
+      btn.textContent = isMuted ? 'Включить микрофон' : 'Выключить микрофон';
+      btn.className = isMuted ? 'muted' : '';
+    }
+
+    function leaveRoom() {
+      ws.send(JSON.stringify({ type: 'leave-room' }));
+      peers.forEach(p => p.close());
+      peers.clear();
+      if (localStream) localStream.getTracks().forEach(t => t.stop());
+      document.querySelectorAll('audio').forEach(a => a.remove());
+      lobby.style.display = 'block';
+      room.style.display = 'none';
+      document.getElementById('controls').style.display = 'none';
+    }
+
+    connectWebSocket();
+  </script>
+</body>
+</html>
